@@ -1,0 +1,4 @@
+{
+  "tickers": ["AAPL", "MSFT"],
+  "lookback_quarters": 4
+}
