@@ -2,6 +2,7 @@ CLAUDE.md
 .env
 normalized_output.json
 __pycache__/
+query/__pycache__/
 *.pyc
 *.pyo
 .DS_Store

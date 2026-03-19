@@ -15,6 +15,7 @@ Lambda deployment:
     Mangum handler at the bottom wraps the ASGI app for API Gateway.
 """
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -28,11 +29,20 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# Load .env for local dev only. override=False ensures Railway's injected env
+# vars are never clobbered — os.environ values always win. No-op if no .env.
 try:
     from dotenv import load_dotenv
-    load_dotenv(_REPO_ROOT / ".env", override=False)
+    load_dotenv(override=False)
 except ImportError:
     pass
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+_log = logging.getLogger("earnings_intelligence")
 
 # ---------------------------------------------------------------------------
 # FastAPI imports — fail loudly so the dev knows what to install
@@ -49,17 +59,33 @@ except ImportError:
 # App
 # ---------------------------------------------------------------------------
 
+_ENV_VARS = ["OPENAI_API_KEY", "PINECONE_API_KEY", "PINECONE_INDEX"]
+
 app = FastAPI(
     title="earnings-intelligence",
     description="RAG pipeline for querying earnings call transcripts.",
     version="0.1.0",
 )
 
+
+@app.on_event("startup")
+def _log_startup_env() -> None:
+    """Log env-var presence at boot so Railway / server logs make it obvious
+    whether the required keys were injected into the process environment."""
+    present = [v for v in _ENV_VARS if os.getenv(v)]
+    missing = [v for v in _ENV_VARS if not os.getenv(v)]
+    _log.info("ENV CHECK — present=%s missing=%s", present, missing)
+    if missing:
+        _log.error(
+            "STARTUP WARNING: required env vars not found in os.environ: %s — "
+            "check Railway variable definitions and redeploy.",
+            missing,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Request / response models
 # ---------------------------------------------------------------------------
-
-_ENV_VARS = ["OPENAI_API_KEY", "PINECONE_API_KEY", "PINECONE_INDEX"]
 
 
 class QueryRequest(BaseModel):
