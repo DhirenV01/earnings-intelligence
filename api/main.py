@@ -51,7 +51,7 @@ _log = logging.getLogger("earnings_intelligence")
 
 try:
     from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-    from fastapi.responses import JSONResponse
+    from fastapi.responses import FileResponse, JSONResponse
     from pydantic import BaseModel
 except ImportError:
     raise ImportError("Run: pip install fastapi python-multipart")
@@ -118,6 +118,21 @@ def root() -> dict:
         "endpoints": ["/health", "/ingest", "/query"],
         "docs":      "/docs",
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /demo
+# ---------------------------------------------------------------------------
+
+_DEMO_HTML = Path(__file__).with_name("demo.html")
+
+
+@app.get("/demo", response_class=FileResponse)
+def demo():
+    """Serve the interactive demo UI."""
+    if not _DEMO_HTML.exists():
+        raise HTTPException(status_code=404, detail="demo.html not found")
+    return FileResponse(_DEMO_HTML, media_type="text/html")
 
 
 # ---------------------------------------------------------------------------
