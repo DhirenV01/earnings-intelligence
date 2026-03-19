@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+mangum
+openai
+pinecone-client
+python-dotenv
+python-multipart
+httpx
