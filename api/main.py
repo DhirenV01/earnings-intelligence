@@ -21,7 +21,9 @@ import logging
 import os
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
@@ -47,6 +49,45 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 _log = logging.getLogger("earnings_intelligence")
+
+# ---------------------------------------------------------------------------
+# DynamoDB setup — optional; falls back to JSONL if boto3 missing or no creds
+# ---------------------------------------------------------------------------
+
+_DYNAMO_TABLE_NAME = "earnings-query-logs"
+_DYNAMO_TABLE      = None  # set below if boto3 is available
+
+try:
+    import boto3
+    _AWS_REGION  = os.getenv("AWS_REGION", "us-east-1")
+    _dynamo_res  = boto3.resource("dynamodb", region_name=_AWS_REGION)
+    _DYNAMO_TABLE = _dynamo_res.Table(_DYNAMO_TABLE_NAME)
+    _log.info("DynamoDB query logging enabled (table=%s, region=%s)", _DYNAMO_TABLE_NAME, _AWS_REGION)
+except ImportError:
+    _log.info("boto3 not installed — query logging falls back to JSONL")
+
+
+def _to_dynamo(obj):
+    """Recursively convert Python floats to Decimal (required by boto3 resource)."""
+    if isinstance(obj, float):
+        return Decimal(str(obj))
+    if isinstance(obj, dict):
+        return {k: _to_dynamo(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_dynamo(i) for i in obj]
+    return obj
+
+
+def _from_dynamo(obj):
+    """Recursively convert DynamoDB Decimal back to int or float."""
+    if isinstance(obj, Decimal):
+        return int(obj) if obj % 1 == 0 else float(obj)
+    if isinstance(obj, dict):
+        return {k: _from_dynamo(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_from_dynamo(i) for i in obj]
+    return obj
+
 
 # ---------------------------------------------------------------------------
 # FastAPI imports — fail loudly so the dev knows what to install
@@ -132,13 +173,53 @@ _LOG_FILE  = _REPO_ROOT / "logs" / "query_log.jsonl"
 
 
 def _log_query(entry: dict) -> None:
-    """Append a query log entry to logs/query_log.jsonl. Never raises."""
+    """Write a query log entry to DynamoDB, falling back to JSONL. Never raises."""
+    entry = {"query_id": str(uuid.uuid4()), **entry}
+
+    if _DYNAMO_TABLE is not None:
+        try:
+            _DYNAMO_TABLE.put_item(Item=_to_dynamo(entry))
+            return
+        except Exception as exc:
+            _log.warning("DynamoDB write failed, falling back to JSONL: %s", exc)
+
+    # JSONL fallback
     try:
         _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with _LOG_FILE.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
     except Exception as exc:
         _log.warning("Query logging failed (non-fatal): %s", exc)
+
+
+def _get_log_entries() -> list:
+    """Return all log entries from DynamoDB (preferred) or JSONL fallback."""
+    if _DYNAMO_TABLE is not None:
+        try:
+            items = []
+            resp = _DYNAMO_TABLE.scan()
+            items.extend(resp.get("Items", []))
+            # DynamoDB paginates at 1 MB; follow LastEvaluatedKey until exhausted
+            while "LastEvaluatedKey" in resp:
+                resp = _DYNAMO_TABLE.scan(ExclusiveStartKey=resp["LastEvaluatedKey"])
+                items.extend(resp.get("Items", []))
+            return [_from_dynamo(item) for item in items]
+        except Exception as exc:
+            _log.warning("DynamoDB scan failed, falling back to JSONL: %s", exc)
+
+    # JSONL fallback
+    if not _LOG_FILE.exists():
+        return []
+    entries = []
+    try:
+        with _LOG_FILE.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    entries.append(json.loads(line))
+    except Exception as exc:
+        _log.warning("Failed to read query log: %s", exc)
+    return entries
 
 
 @app.get("/demo", response_class=FileResponse)
@@ -275,8 +356,8 @@ def query(request: QueryRequest) -> dict:
 @app.get("/metrics")
 def metrics() -> dict:
     """
-    Aggregate statistics derived from logs/query_log.jsonl.
-    Returns zeroed-out metrics if the log file does not exist yet.
+    Aggregate statistics derived from DynamoDB (or logs/query_log.jsonl fallback).
+    Returns zeroed-out metrics if no log entries exist yet.
     """
     _ZERO = {
         "total_queries": 0,
@@ -287,20 +368,7 @@ def metrics() -> dict:
         "last_10_queries": [],
     }
 
-    if not _LOG_FILE.exists():
-        return _ZERO
-
-    entries = []
-    try:
-        with _LOG_FILE.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    entries.append(json.loads(line))
-    except Exception as exc:
-        _log.warning("Failed to read query log for /metrics: %s", exc)
-        return _ZERO
-
+    entries = _get_log_entries()
     if not entries:
         return _ZERO
 
@@ -324,13 +392,14 @@ def metrics() -> dict:
             found_count += 1
 
     n = len(entries)
+    last_10 = sorted(entries, key=lambda e: e.get("timestamp", ""), reverse=True)[:10]
     return {
         "total_queries":          n,
         "queries_by_confidence":  confidence_counts,
         "queries_by_ticker":      ticker_counts,
         "average_chunks_used":    round(total_chunks / n, 2),
         "found_rate":             round(found_count / n * 100, 1),
-        "last_10_queries":        entries[-10:],
+        "last_10_queries":        last_10,
     }
 
 

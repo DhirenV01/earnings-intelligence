@@ -2,7 +2,8 @@ fastapi
 uvicorn
 mangum
 openai
-pinecone 
+pinecone
 python-dotenv
 python-multipart
 httpx
+boto3
