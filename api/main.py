@@ -4,9 +4,13 @@ api/main.py
 FastAPI application for the earnings-intelligence RAG pipeline.
 
 Endpoints:
-    POST /ingest   Multipart upload: .txt file + ticker → ingest_transcript()
-    POST /query    JSON body: question + optional filters → query_transcripts()
-    GET  /health   Env-var presence check
+    GET  /            Service info and available endpoints
+    GET  /health      Liveness check (is the process running?)
+    GET  /ready       Readiness check (can I serve traffic?)
+    GET  /demo        Interactive demo UI
+    GET  /metrics     Aggregate query statistics
+    POST /ingest      Multipart upload: .txt file + ticker -> ingest_transcript()
+    POST /query       JSON body: question + optional filters -> query_transcripts()
 
 Local dev:
     uvicorn api.main:app --reload --port 8000
@@ -15,17 +19,19 @@ Lambda deployment:
     Mangum handler at the bottom wraps the ASGI app for API Gateway.
 """
 
-from fastapi.middleware.cors import CORSMiddleware
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
+from typing import Optional
+
 import json
 import logging
 import os
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
-from decimal import Decimal
-from pathlib import Path
-from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Repo-root sys.path injection (same pattern as ingest_upload.py / query.py)
@@ -36,7 +42,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 # Load .env for local dev only. override=False ensures Railway's injected env
-# vars are never clobbered — os.environ values always win. No-op if no .env.
+# vars are never clobbered -- os.environ values always win. No-op if no .env.
 try:
     from dotenv import load_dotenv
     load_dotenv(override=False)
@@ -45,13 +51,13 @@ except ImportError:
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 _log = logging.getLogger("earnings_intelligence")
 
 # ---------------------------------------------------------------------------
-# DynamoDB setup — optional; falls back to JSONL if boto3 missing or no creds
+# DynamoDB setup -- optional; falls back to JSONL if boto3 missing or no creds
 # ---------------------------------------------------------------------------
 
 _DYNAMO_TABLE_NAME = "earnings-query-logs"
@@ -64,7 +70,7 @@ try:
     _DYNAMO_TABLE = _dynamo_res.Table(_DYNAMO_TABLE_NAME)
     _log.info("DynamoDB query logging enabled (table=%s, region=%s)", _DYNAMO_TABLE_NAME, _AWS_REGION)
 except ImportError:
-    _log.info("boto3 not installed — query logging falls back to JSONL")
+    _log.info("boto3 not installed -- query logging falls back to JSONL")
 
 
 def _to_dynamo(obj):
@@ -90,56 +96,146 @@ def _from_dynamo(obj):
 
 
 # ---------------------------------------------------------------------------
-# FastAPI imports — fail loudly so the dev knows what to install
+# FastAPI imports
 # ---------------------------------------------------------------------------
 
 try:
-    from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+    from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+    from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, JSONResponse
     from pydantic import BaseModel
 except ImportError:
     raise ImportError("Run: pip install fastapi python-multipart")
 
 # ---------------------------------------------------------------------------
-# App
+# Constants
 # ---------------------------------------------------------------------------
 
 _ENV_VARS = ["OPENAI_API_KEY", "PINECONE_API_KEY", "PINECONE_INDEX"]
 
+_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://localhost:8000",
+]
+# In production, append your real frontend domain:
+# _ALLOWED_ORIGINS.append("https://earnings-agent.yourdomain.com")
+
+# For portfolio/demo mode, allow all origins. Swap to _ALLOWED_ORIGINS for prod.
+_CORS_ORIGINS = ["*"]
+
+_DEMO_HTML = Path(__file__).with_name("demo.html")
+_LOG_FILE  = _REPO_ROOT / "logs" / "query_log.jsonl"
+
+_QUERY_TIMEOUT_SECONDS = 30.0
+
+# Rate limiting: requests per user per window
+_RATE_LIMIT_WINDOW  = 60   # seconds
+_RATE_LIMIT_MAX     = 30   # max requests per window
+_rate_limit_tracker: dict[str, list[float]] = defaultdict(list)
+
+
+# ---------------------------------------------------------------------------
+# Lifespan (replaces deprecated @app.on_event)
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown logic. Resources loaded here are available
+    on app.state throughout the application lifetime."""
+
+    # -- Startup --
+    present = [v for v in _ENV_VARS if os.getenv(v)]
+    missing = [v for v in _ENV_VARS if not os.getenv(v)]
+    _log.info("ENV CHECK: present=%s missing=%s", present, missing)
+    if missing:
+        _log.error(
+            "STARTUP WARNING: required env vars not found: %s "
+            "-- check Railway variable definitions and redeploy.",
+            missing,
+        )
+    app.state.ready = not missing  # only ready if all env vars are present
+
+    yield
+
+    # -- Shutdown --
+    _log.info("Shutting down gracefully.")
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
 app = FastAPI(
     title="earnings-intelligence",
     description="RAG pipeline for querying earnings call transcripts.",
-    version="0.1.0",
+    version="0.2.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-@app.on_event("startup")
-def _log_startup_env() -> None:
-    """Log env-var presence at boot so Railway / server logs make it obvious
-    whether the required keys were injected into the process environment."""
-    present = [v for v in _ENV_VARS if os.getenv(v)]
-    missing = [v for v in _ENV_VARS if not os.getenv(v)]
-    _log.info("ENV CHECK — present=%s missing=%s", present, missing)
-    if missing:
-        _log.error(
-            "STARTUP WARNING: required env vars not found in os.environ: %s — "
-            "check Railway variable definitions and redeploy.",
-            missing,
+# ---------------------------------------------------------------------------
+# Middleware: request latency tracking
+# ---------------------------------------------------------------------------
+
+@app.middleware("http")
+async def track_latency(request: Request, call_next):
+    """Attach response time header to every response for observability."""
+    start = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = (time.perf_counter() - start) * 1000
+    response.headers["X-Response-Time-Ms"] = str(round(duration_ms, 1))
+    _log.info(
+        "%s %s - %.1fms - %s",
+        request.method,
+        request.url.path,
+        duration_ms,
+        response.status_code,
+    )
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Middleware: rate limiting (in-memory, per-process)
+# ---------------------------------------------------------------------------
+
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
+    """Simple sliding-window rate limiter. Skips health/readiness checks.
+    In production with multiple replicas, replace with Redis-backed limiter."""
+    skip_paths = {"/health", "/ready", "/docs", "/openapi.json"}
+    if request.url.path in skip_paths:
+        return await call_next(request)
+
+    client_id = request.headers.get("X-User-Id", request.client.host if request.client else "unknown")
+    now = time.time()
+
+    # Prune expired entries, check limit
+    _rate_limit_tracker[client_id] = [
+        t for t in _rate_limit_tracker[client_id] if now - t < _RATE_LIMIT_WINDOW
+    ]
+    if len(_rate_limit_tracker[client_id]) >= _RATE_LIMIT_MAX:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded. Try again shortly."},
+            headers={"Retry-After": str(_RATE_LIMIT_WINDOW)},
         )
+
+    _rate_limit_tracker[client_id].append(now)
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
 # Request / response models
 # ---------------------------------------------------------------------------
-
 
 class QueryRequest(BaseModel):
     question: str
@@ -150,27 +246,8 @@ class QueryRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# GET /
+# Helpers: query logging
 # ---------------------------------------------------------------------------
-
-@app.get("/")
-def root() -> dict:
-    """Service info and available endpoints."""
-    return {
-        "name":      "Earnings Call Intelligence Agent",
-        "version":   "1.0",
-        "endpoints": ["/health", "/ingest", "/query"],
-        "docs":      "/docs",
-    }
-
-
-# ---------------------------------------------------------------------------
-# GET /demo
-# ---------------------------------------------------------------------------
-
-_DEMO_HTML = Path(__file__).with_name("demo.html")
-_LOG_FILE  = _REPO_ROOT / "logs" / "query_log.jsonl"
-
 
 def _log_query(entry: dict) -> None:
     """Write a query log entry to DynamoDB, falling back to JSONL. Never raises."""
@@ -222,25 +299,63 @@ def _get_log_entries() -> list:
     return entries
 
 
+# ---------------------------------------------------------------------------
+# GET /
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+def root() -> dict:
+    """Service info and available endpoints."""
+    return {
+        "name":      "Earnings Call Intelligence Agent",
+        "version":   "0.2.0",
+        "endpoints": ["/health", "/ready", "/ingest", "/query", "/metrics"],
+        "docs":      "/docs",
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /health  (liveness)
+# ---------------------------------------------------------------------------
+
+@app.get("/health")
+def health() -> dict:
+    """Liveness check: is the process alive and responding?
+    Load balancers and container orchestrators use this to detect crashed processes."""
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# GET /ready  (readiness)
+# ---------------------------------------------------------------------------
+
+@app.get("/ready")
+def ready() -> dict:
+    """Readiness check: is the service ready to handle traffic?
+    Returns 503 if required env vars are missing. Load balancers use this
+    to decide whether to route requests to this instance."""
+    missing = [v for v in _ENV_VARS if not os.getenv(v)]
+    if missing:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Not ready: missing env vars {missing}",
+        )
+    return {
+        "status":       "ready",
+        "env_vars_set": [v for v in _ENV_VARS if os.getenv(v)],
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /demo
+# ---------------------------------------------------------------------------
+
 @app.get("/demo", response_class=FileResponse)
 def demo():
     """Serve the interactive demo UI."""
     if not _DEMO_HTML.exists():
         raise HTTPException(status_code=404, detail="demo.html not found")
     return FileResponse(_DEMO_HTML, media_type="text/html")
-
-
-# ---------------------------------------------------------------------------
-# GET /health
-# ---------------------------------------------------------------------------
-
-@app.get("/health")
-def health() -> dict:
-    """Returns service status and which required env vars are set."""
-    return {
-        "status":       "ok",
-        "env_vars_set": [v for v in _ENV_VARS if os.getenv(v)],
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +370,7 @@ async def ingest(
 ) -> dict:
     """
     Accept a .txt transcript file and a ticker symbol, run the full
-    normalize → embed → upsert pipeline, and return the ingest summary.
+    normalize -> embed -> upsert pipeline, and return the ingest summary.
 
     Returns the dict from ingest_transcript():
         transcript_id, chunks_upserted, tokens_estimated, elapsed_seconds, skipped
@@ -273,9 +388,9 @@ async def ingest(
         from ingestion.ingest_upload import ingest_transcript
         result = ingest_transcript(ticker=ticker, raw_text=raw_text, force=force)
     except ValueError as exc:
-        # ingest_transcript raises ValueError for bad inputs (e.g. empty ticker)
         raise HTTPException(status_code=422, detail=str(exc))
     except Exception as exc:
+        _log.exception("Ingest pipeline error")
         raise HTTPException(status_code=500, detail=f"Ingest pipeline error: {exc}")
 
     return result
@@ -286,16 +401,17 @@ async def ingest(
 # ---------------------------------------------------------------------------
 
 @app.post("/query", status_code=200)
-def query(request: QueryRequest) -> dict:
+async def query(request: QueryRequest) -> dict:
     """
     Accept a natural language question and optional metadata filters,
     run the RAG query pipeline, and return the grounded answer with sources.
 
-    The response mirrors QueryResponse from query.py, serialised to a dict:
-        question, answer, found, confidence, model, chunks_used, sources[]
+    Includes a timeout to prevent long-running queries from blocking the server.
     """
     if not request.question.strip():
         raise HTTPException(status_code=422, detail="question must not be empty")
+
+    import asyncio
 
     try:
         from query.query import QueryFilter, query_transcripts
@@ -305,10 +421,25 @@ def query(request: QueryRequest) -> dict:
             role    = request.role,
             section = request.section,
         )
+
         _t0 = time.monotonic()
-        result = query_transcripts(request.question, filters)
+
+        # Run the sync pipeline in a thread with a timeout so one slow query
+        # can't block the event loop or hang indefinitely.
+        result = await asyncio.wait_for(
+            asyncio.to_thread(query_transcripts, request.question, filters),
+            timeout=_QUERY_TIMEOUT_SECONDS,
+        )
+
         _elapsed = round(time.monotonic() - _t0, 3)
+
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Query timed out after {_QUERY_TIMEOUT_SECONDS}s",
+        )
     except Exception as exc:
+        _log.exception("Query pipeline error")
         raise HTTPException(status_code=500, detail=f"Query pipeline error: {exc}")
 
     _log_query({
@@ -365,6 +496,7 @@ def metrics() -> dict:
         "queries_by_ticker": {},
         "average_chunks_used": 0.0,
         "found_rate": 0.0,
+        "average_latency_seconds": 0.0,
         "last_10_queries": [],
     }
 
@@ -375,6 +507,7 @@ def metrics() -> dict:
     confidence_counts: dict = {"high": 0, "medium": 0, "low": 0}
     ticker_counts: dict     = {}
     total_chunks             = 0
+    total_latency            = 0.0
     found_count              = 0
 
     for e in entries:
@@ -386,7 +519,8 @@ def metrics() -> dict:
         if ticker:
             ticker_counts[ticker] = ticker_counts.get(ticker, 0) + 1
 
-        total_chunks += e.get("chunks_used", 0)
+        total_chunks  += e.get("chunks_used", 0)
+        total_latency += e.get("elapsed_seconds", 0.0)
 
         if e.get("found", False):
             found_count += 1
@@ -394,12 +528,13 @@ def metrics() -> dict:
     n = len(entries)
     last_10 = sorted(entries, key=lambda e: e.get("timestamp", ""), reverse=True)[:10]
     return {
-        "total_queries":          n,
-        "queries_by_confidence":  confidence_counts,
-        "queries_by_ticker":      ticker_counts,
-        "average_chunks_used":    round(total_chunks / n, 2),
-        "found_rate":             round(found_count / n * 100, 1),
-        "last_10_queries":        last_10,
+        "total_queries":           n,
+        "queries_by_confidence":   confidence_counts,
+        "queries_by_ticker":       ticker_counts,
+        "average_chunks_used":     round(total_chunks / n, 2),
+        "found_rate":              round(found_count / n * 100, 1),
+        "average_latency_seconds": round(total_latency / n, 3),
+        "last_10_queries":         last_10,
     }
 
 
