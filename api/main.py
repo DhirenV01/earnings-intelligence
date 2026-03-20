@@ -16,9 +16,12 @@ Lambda deployment:
 """
 
 from fastapi.middleware.cors import CORSMiddleware
+import json
 import logging
 import os
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -125,6 +128,17 @@ def root() -> dict:
 # ---------------------------------------------------------------------------
 
 _DEMO_HTML = Path(__file__).with_name("demo.html")
+_LOG_FILE  = _REPO_ROOT / "logs" / "query_log.jsonl"
+
+
+def _log_query(entry: dict) -> None:
+    """Append a query log entry to logs/query_log.jsonl. Never raises."""
+    try:
+        _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as exc:
+        _log.warning("Query logging failed (non-fatal): %s", exc)
 
 
 @app.get("/demo", response_class=FileResponse)
@@ -210,9 +224,25 @@ def query(request: QueryRequest) -> dict:
             role    = request.role,
             section = request.section,
         )
+        _t0 = time.monotonic()
         result = query_transcripts(request.question, filters)
+        _elapsed = round(time.monotonic() - _t0, 3)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Query pipeline error: {exc}")
+
+    _log_query({
+        "timestamp":      datetime.now(timezone.utc).isoformat(),
+        "question":       result.question,
+        "ticker_filter":  request.ticker,
+        "quarter_filter": request.quarter,
+        "role_filter":    request.role,
+        "section_filter": request.section,
+        "found":          result.found,
+        "confidence":     result.confidence,
+        "chunks_used":    result.chunks_used,
+        "model":          result.model,
+        "elapsed_seconds": _elapsed,
+    })
 
     return {
         "question":    result.question,
@@ -235,6 +265,72 @@ def query(request: QueryRequest) -> dict:
             }
             for s in result.sources
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /metrics
+# ---------------------------------------------------------------------------
+
+@app.get("/metrics")
+def metrics() -> dict:
+    """
+    Aggregate statistics derived from logs/query_log.jsonl.
+    Returns zeroed-out metrics if the log file does not exist yet.
+    """
+    _ZERO = {
+        "total_queries": 0,
+        "queries_by_confidence": {"high": 0, "medium": 0, "low": 0},
+        "queries_by_ticker": {},
+        "average_chunks_used": 0.0,
+        "found_rate": 0.0,
+        "last_10_queries": [],
+    }
+
+    if not _LOG_FILE.exists():
+        return _ZERO
+
+    entries = []
+    try:
+        with _LOG_FILE.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    entries.append(json.loads(line))
+    except Exception as exc:
+        _log.warning("Failed to read query log for /metrics: %s", exc)
+        return _ZERO
+
+    if not entries:
+        return _ZERO
+
+    confidence_counts: dict = {"high": 0, "medium": 0, "low": 0}
+    ticker_counts: dict     = {}
+    total_chunks             = 0
+    found_count              = 0
+
+    for e in entries:
+        conf = e.get("confidence", "medium")
+        if conf in confidence_counts:
+            confidence_counts[conf] += 1
+
+        ticker = e.get("ticker_filter")
+        if ticker:
+            ticker_counts[ticker] = ticker_counts.get(ticker, 0) + 1
+
+        total_chunks += e.get("chunks_used", 0)
+
+        if e.get("found", False):
+            found_count += 1
+
+    n = len(entries)
+    return {
+        "total_queries":          n,
+        "queries_by_confidence":  confidence_counts,
+        "queries_by_ticker":      ticker_counts,
+        "average_chunks_used":    round(total_chunks / n, 2),
+        "found_rate":             round(found_count / n * 100, 1),
+        "last_10_queries":        entries[-10:],
     }
 
 

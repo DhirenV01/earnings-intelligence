@@ -8,3 +8,4 @@ query/__pycache__/
 .DS_Store
 .claude/
 data/samples/
+logs/

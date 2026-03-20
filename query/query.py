@@ -184,7 +184,10 @@ def _embed_query(question: str) -> list[float]:
     except ImportError:
         raise ImportError("Run: pip install openai")
 
-    client   = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set in the environment")
+    client   = OpenAI(api_key=api_key)
     response = client.embeddings.create(
         model = EMBEDDING_MODEL,
         input = [question],
@@ -241,7 +244,10 @@ def _retrieve_chunks(
     except ImportError:
         raise ImportError("Run: pip install pinecone-client")
 
-    pc    = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+    pinecone_key = os.getenv("PINECONE_API_KEY")
+    if not pinecone_key:
+        raise RuntimeError("PINECONE_API_KEY is not set in the environment")
+    pc    = Pinecone(api_key=pinecone_key)
     index = pc.Index(PINECONE_INDEX)
 
     pinecone_filter = _build_pinecone_filter(filters)
@@ -362,7 +368,10 @@ def _call_gpt(
     except ImportError:
         raise ImportError("Run: pip install openai")
 
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set in the environment")
+    client = OpenAI(api_key=api_key)
 
     user_message = f"""
 TRANSCRIPT EXCERPTS:
