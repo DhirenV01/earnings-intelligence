@@ -227,7 +227,10 @@ def _transcript_exists_in_pinecone(transcript_id: str) -> bool:
         raise ImportError("Run: pip install pinecone-client")
 
     index_name = os.getenv("PINECONE_INDEX", "earnings-intelligence")
-    pc    = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+    pinecone_key = os.getenv("PINECONE_API_KEY")
+    if not pinecone_key:
+        raise RuntimeError("PINECONE_API_KEY is not set in the environment")
+    pc    = Pinecone(api_key=pinecone_key)
     index = pc.Index(index_name)
 
     # Use a zero vector — we only care about the metadata filter match, not ANN ranking

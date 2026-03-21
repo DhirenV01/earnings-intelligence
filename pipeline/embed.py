@@ -236,7 +236,10 @@ def _embed_chunks(chunks: list[Chunk]) -> list[Chunk]:
     except ImportError:
         raise ImportError("Run: pip install openai")
 
-    client    = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set in the environment")
+    client    = OpenAI(api_key=api_key)
     texts     = [c.text for c in chunks]
     all_embeddings = []
 
@@ -293,7 +296,10 @@ def _upsert_to_pinecone(chunks: list[Chunk]) -> None:
     except ImportError:
         raise ImportError("Run: pip install pinecone-client")
 
-    pc    = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+    pinecone_key = os.getenv("PINECONE_API_KEY")
+    if not pinecone_key:
+        raise RuntimeError("PINECONE_API_KEY is not set in the environment")
+    pc    = Pinecone(api_key=pinecone_key)
     index = pc.Index(PINECONE_INDEX)
 
     vectors = []
