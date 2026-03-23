@@ -24,7 +24,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import json
 import logging
@@ -245,6 +245,55 @@ class QueryRequest(BaseModel):
     section:  Optional[str] = None
 
 
+class HealthResponse(BaseModel):
+    status: str
+
+
+class ReadyResponse(BaseModel):
+    status:       str
+    env_vars_set: List[str]
+
+
+class IngestResponse(BaseModel):
+    transcript_id:    str
+    chunks_upserted:  int
+    tokens_estimated: int
+    elapsed_seconds:  float
+    skipped:          bool
+
+
+class SourceChunkOut(BaseModel):
+    chunk_id: str
+    speaker:  str
+    role:     str
+    firm:     str
+    ticker:   str
+    quarter:  str
+    section:  str
+    score:    float
+    text:     str
+
+
+class QueryApiResponse(BaseModel):
+    question:    str
+    answer:      str
+    found:       bool
+    confidence:  str
+    model:       str
+    chunks_used: int
+    sources:     List[SourceChunkOut]
+
+
+class MetricsResponse(BaseModel):
+    total_queries:            int
+    queries_by_confidence:    Dict[str, int]
+    queries_by_ticker:        Dict[str, int]
+    average_chunks_used:      float
+    found_rate:               float
+    average_latency_seconds:  float
+    last_10_queries:          List[Dict[str, Any]]
+
+
 # ---------------------------------------------------------------------------
 # Helpers: query logging
 # ---------------------------------------------------------------------------
@@ -318,19 +367,19 @@ def root() -> dict:
 # GET /health  (liveness)
 # ---------------------------------------------------------------------------
 
-@app.get("/health")
-def health() -> dict:
+@app.get("/health", response_model=HealthResponse)
+def health() -> HealthResponse:
     """Liveness check: is the process alive and responding?
     Load balancers and container orchestrators use this to detect crashed processes."""
-    return {"status": "ok"}
+    return HealthResponse(status="ok")
 
 
 # ---------------------------------------------------------------------------
 # GET /ready  (readiness)
 # ---------------------------------------------------------------------------
 
-@app.get("/ready")
-def ready() -> dict:
+@app.get("/ready", response_model=ReadyResponse)
+def ready() -> ReadyResponse:
     """Readiness check: is the service ready to handle traffic?
     Returns 503 if required env vars are missing. Load balancers use this
     to decide whether to route requests to this instance."""
@@ -340,10 +389,10 @@ def ready() -> dict:
             status_code=503,
             detail=f"Not ready: missing env vars {missing}",
         )
-    return {
-        "status":       "ready",
-        "env_vars_set": [v for v in _ENV_VARS if os.getenv(v)],
-    }
+    return ReadyResponse(
+        status="ready",
+        env_vars_set=[v for v in _ENV_VARS if os.getenv(v)],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -362,12 +411,12 @@ def demo():
 # POST /ingest
 # ---------------------------------------------------------------------------
 
-@app.post("/ingest", status_code=200)
+@app.post("/ingest", status_code=200, response_model=IngestResponse)
 async def ingest(
     file:   UploadFile = File(..., description="Raw .txt earnings call transcript"),
     ticker: str        = Form(..., description="Equity ticker, e.g. AAPL"),
     force:  bool       = Form(False, description="Overwrite if transcript already exists"),
-) -> dict:
+) -> IngestResponse:
     """
     Accept a .txt transcript file and a ticker symbol, run the full
     normalize -> embed -> upsert pipeline, and return the ingest summary.
@@ -393,15 +442,15 @@ async def ingest(
         _log.exception("Ingest pipeline error")
         raise HTTPException(status_code=500, detail=f"Ingest pipeline error: {exc}")
 
-    return result
+    return IngestResponse(**result)
 
 
 # ---------------------------------------------------------------------------
 # POST /query
 # ---------------------------------------------------------------------------
 
-@app.post("/query", status_code=200)
-async def query(request: QueryRequest) -> dict:
+@app.post("/query", status_code=200, response_model=QueryApiResponse)
+async def query(request: QueryRequest) -> QueryApiResponse:
     """
     Accept a natural language question and optional metadata filters,
     run the RAG query pipeline, and return the grounded answer with sources.
@@ -456,49 +505,49 @@ async def query(request: QueryRequest) -> dict:
         "elapsed_seconds": _elapsed,
     })
 
-    return {
-        "question":    result.question,
-        "answer":      result.answer,
-        "found":       result.found,
-        "confidence":  result.confidence,
-        "model":       result.model,
-        "chunks_used": result.chunks_used,
-        "sources": [
-            {
-                "chunk_id": s.chunk_id,
-                "speaker":  s.speaker,
-                "role":     s.role,
-                "firm":     s.firm,
-                "ticker":   s.ticker,
-                "quarter":  s.quarter,
-                "section":  s.section,
-                "score":    s.score,
-                "text":     s.text,
-            }
+    return QueryApiResponse(
+        question    = result.question,
+        answer      = result.answer,
+        found       = result.found,
+        confidence  = result.confidence,
+        model       = result.model,
+        chunks_used = result.chunks_used,
+        sources     = [
+            SourceChunkOut(
+                chunk_id = s.chunk_id,
+                speaker  = s.speaker,
+                role     = s.role,
+                firm     = s.firm,
+                ticker   = s.ticker,
+                quarter  = s.quarter,
+                section  = s.section,
+                score    = s.score,
+                text     = s.text,
+            )
             for s in result.sources
         ],
-    }
+    )
 
 
 # ---------------------------------------------------------------------------
 # GET /metrics
 # ---------------------------------------------------------------------------
 
-@app.get("/metrics")
-def metrics() -> dict:
+@app.get("/metrics", response_model=MetricsResponse)
+def metrics() -> MetricsResponse:
     """
     Aggregate statistics derived from DynamoDB (or logs/query_log.jsonl fallback).
     Returns zeroed-out metrics if no log entries exist yet.
     """
-    _ZERO = {
-        "total_queries": 0,
-        "queries_by_confidence": {"high": 0, "medium": 0, "low": 0},
-        "queries_by_ticker": {},
-        "average_chunks_used": 0.0,
-        "found_rate": 0.0,
-        "average_latency_seconds": 0.0,
-        "last_10_queries": [],
-    }
+    _ZERO = MetricsResponse(
+        total_queries=0,
+        queries_by_confidence={"high": 0, "medium": 0, "low": 0},
+        queries_by_ticker={},
+        average_chunks_used=0.0,
+        found_rate=0.0,
+        average_latency_seconds=0.0,
+        last_10_queries=[],
+    )
 
     entries = _get_log_entries()
     if not entries:
@@ -527,15 +576,15 @@ def metrics() -> dict:
 
     n = len(entries)
     last_10 = sorted(entries, key=lambda e: e.get("timestamp", ""), reverse=True)[:10]
-    return {
-        "total_queries":           n,
-        "queries_by_confidence":   confidence_counts,
-        "queries_by_ticker":       ticker_counts,
-        "average_chunks_used":     round(total_chunks / n, 2),
-        "found_rate":              round(found_count / n * 100, 1),
-        "average_latency_seconds": round(total_latency / n, 3),
-        "last_10_queries":         last_10,
-    }
+    return MetricsResponse(
+        total_queries           = n,
+        queries_by_confidence   = confidence_counts,
+        queries_by_ticker       = ticker_counts,
+        average_chunks_used     = round(total_chunks / n, 2),
+        found_rate              = round(found_count / n * 100, 1),
+        average_latency_seconds = round(total_latency / n, 3),
+        last_10_queries         = last_10,
+    )
 
 
 # ---------------------------------------------------------------------------

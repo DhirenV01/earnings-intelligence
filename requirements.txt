@@ -1,9 +1,18 @@
-fastapi
-uvicorn
-mangum
-openai
-pinecone
-python-dotenv
-python-multipart
-httpx
-boto3
+# Runtime
+openai==2.29.0
+pinecone==7.3.0
+fastapi==0.128.8
+uvicorn==0.39.0
+pydantic==2.9.2
+python-dotenv==1.0.1
+python-multipart==0.0.20
+mangum==0.21.0          # Lambda / API Gateway adapter (no-op for local dev)
+
+# Optional: DynamoDB query logging — api/main.py falls back to JSONL without it
+# boto3
+
+# Test
+pytest==8.4.2
+pytest-asyncio==1.2.0
+httpx==0.28.1
+anyio==4.12.1
